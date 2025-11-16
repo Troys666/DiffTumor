@@ -13,6 +13,8 @@ import torch.utils.data.distributed
 from monai.transforms.transform import MapTransform
 import sys
 from os import environ
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
 
 from monai.inferers import sliding_window_inference
 # from monai.data import DataLoader, Dataset
@@ -22,7 +24,8 @@ from monai.utils.enums import MetricReduction
 from monai.data import load_decathlon_datalist
 from monai.transforms import AsDiscrete,Activations,Compose
 
-from monai import transforms, data
+from monai import transforms
+from monai import data as monai_data
 from monai_trainer import AMDistributedSampler, run_training
 from optimizers.lr_scheduler import WarmupCosineSchedule,LinearWarmupCosineAnnealingLR
 from networks.unetr import UNETR
@@ -121,6 +124,7 @@ parser.add_argument('--datafold_dir', default=None, type=str)
 parser.add_argument('--cache_num', default=200, type=int)
 
 parser.add_argument('--use_pretrained', action='store_true')
+parser.add_argument('--save_dir', default='./generated_samples', type=str, help='directory to save generated images')
 
 class RandCropByPosNegLabeld_select(transforms.RandCropByPosNegLabeld):
     def __init__(self, keys, label_key, spatial_size, 
@@ -200,6 +204,75 @@ class LoadImage_val(transforms.LoadImaged):
 
         return d
     
+def save_synt_img(synt_data, synt_target, data_name, synt_type, save_dir, organ_type):
+    """
+    Save synthetic image and label as .nii.gz and visualization slices as .png.
+    Saves axial, sagittal, and coronal views for comprehensive visualization.
+    """
+    # Sanitize data_name to be a valid filename
+    safe_data_name = data_name.replace('/', '_')
+
+    # Define paths for NIfTI files
+    nii_img_path = os.path.join(save_dir, f"{safe_data_name}_{synt_type}_img.nii.gz")
+    nii_lbl_path = os.path.join(save_dir, f"{safe_data_name}_{synt_type}_lbl.nii.gz")
+
+    # Ensure the full directory path exists before saving
+    os.makedirs(os.path.dirname(nii_img_path), exist_ok=True)
+
+    # Define custom colormap: background transparent, organ green, tumor red
+    colors = [(0, 0, 0, 0), (0, 1, 0, 0.5), (1, 0, 0, 0.5)]  # R, G, B, A
+    cmap = ListedColormap(colors)
+
+    # Convert to numpy arrays
+    img_np = synt_data.squeeze().cpu().numpy()
+    lbl_np = synt_target.squeeze().cpu().numpy()
+
+    # Save as NIfTI
+    nii_img = nb.Nifti1Image(img_np, affine=np.eye(4))
+    nii_lbl = nb.Nifti1Image(lbl_np, affine=np.eye(4))
+    nb.save(nii_img, nii_img_path)
+    nb.save(nii_lbl, nii_lbl_path)
+
+    # Save multi-view visualization (axial, sagittal, coronal)
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # Axial view (z-axis)
+    axial_idx = img_np.shape[2] // 2
+    axes[0, 0].imshow(img_np[:, :, axial_idx], cmap='gray')
+    axes[0, 0].set_title(f'Axial - Image')
+    axes[0, 0].axis('off')
+    axes[1, 0].imshow(img_np[:, :, axial_idx], cmap='gray')
+    axes[1, 0].imshow(lbl_np[:, :, axial_idx], cmap=cmap, interpolation='none')
+    axes[1, 0].set_title(f'Axial - Overlay')
+    axes[1, 0].axis('off')
+    
+    # Sagittal view (x-axis)
+    sagittal_idx = img_np.shape[0] // 2
+    axes[0, 1].imshow(img_np[sagittal_idx, :, :].T, cmap='gray', origin='lower')
+    axes[0, 1].set_title(f'Sagittal - Image')
+    axes[0, 1].axis('off')
+    axes[1, 1].imshow(img_np[sagittal_idx, :, :].T, cmap='gray', origin='lower')
+    axes[1, 1].imshow(lbl_np[sagittal_idx, :, :].T, cmap=cmap, interpolation='none', origin='lower')
+    axes[1, 1].set_title(f'Sagittal - Overlay')
+    axes[1, 1].axis('off')
+    
+    # Coronal view (y-axis)
+    coronal_idx = img_np.shape[1] // 2
+    axes[0, 2].imshow(img_np[:, coronal_idx, :].T, cmap='gray', origin='lower')
+    axes[0, 2].set_title(f'Coronal - Image')
+    axes[0, 2].axis('off')
+    axes[1, 2].imshow(img_np[:, coronal_idx, :].T, cmap='gray', origin='lower')
+    axes[1, 2].imshow(lbl_np[:, coronal_idx, :].T, cmap=cmap, interpolation='none', origin='lower')
+    axes[1, 2].set_title(f'Coronal - Overlay')
+    axes[1, 2].axis('off')
+    
+    plt.suptitle(f'{safe_data_name} - {synt_type} tumor ({organ_type})', fontsize=16)
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f"{safe_data_name}_{synt_type}_multiview.png"), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    
+    print(f"Saved synthetic {synt_type} tumor for {safe_data_name} to {save_dir}")
+
 def _get_transform(args):
 
     train_transform = transforms.Compose(
@@ -421,14 +494,14 @@ def main_worker(gpu, args):
         imgnb = nb.load(imagepath)
         val_shape_dict[imagename] = [imgnb.shape[0], imgnb.shape[1], imgnb.shape[2]]
 
-    train_ds = data.PersistentDataset(data=data_dicts_train, transform=train_transform, cache_dir=args.cache_dir)
+    train_ds = monai_data.PersistentDataset(data=data_dicts_train, transform=train_transform, cache_dir=args.cache_dir)
     train_sampler = AMDistributedSampler(train_ds) if args.distributed else None
-    train_loader = data.DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=args.workers, sampler=train_sampler, pin_memory=True)
+    train_loader = monai_data.DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=args.workers, sampler=train_sampler, pin_memory=True)
 
 
-    val_ds = data.Dataset(data=data_dicts_val, transform=val_transform)
+    val_ds = monai_data.Dataset(data=data_dicts_val, transform=val_transform)
     val_sampler = AMDistributedSampler(val_ds, shuffle=False) if args.distributed else None
-    val_loader = data.DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=args.workers//2, sampler=val_sampler, pin_memory=True)
+    val_loader = monai_data.DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=args.workers//2, sampler=val_sampler, pin_memory=True)
 
     model_inferer = partial(sliding_window_inference, roi_size=inf_size, sw_batch_size=1, predictor=model,  overlap=args.val_overlap, mode='gaussian')
 
@@ -493,22 +566,51 @@ def main_worker(gpu, args):
         scheduler = None
 
 
+    from TumorGeneration.utils import synthesize_early_tumor, synthesize_medium_tumor, synthesize_large_tumor, synt_model_prepare
+    import random
+    if args.organ_type == 'liver':
+        sample_thresh = 0.5
+    elif args.organ_type == 'pancreas':
+        sample_thresh = 0.5
+    elif args.organ_type == 'kidney':
+        sample_thresh = 0.5
+    # model prepare
+    vqgan, early_sampler, noearly_sampler= synt_model_prepare(device = torch.device("cuda", args.rank), fold=args.fold, organ=args.organ_model)
 
-    accuracy = run_training(model=model,
-                             train_loader=train_loader,
-                             val_loader=val_loader,
-                             optimizer=optimizer,
-                             loss_func=dice_loss,
-                             args=args,
-                             model_inferer=model_inferer,
-                             scheduler=scheduler,
-                             start_epoch=start_epoch,
-                             val_channel_names=val_channel_names,
-                             val_shape_dict=val_shape_dict,
-                             post_label=post_label,
-                             post_pred=post_pred, val_acc_max = best_acc)
+    for idx, batch_data in enumerate(train_loader):
 
-    return accuracy
+        if isinstance(batch_data, list):
+            data, target = batch_data
+        else:
+            data, target, data_names = batch_data['image'], batch_data['label'], batch_data['name']
+        data, target = data.cuda(args.rank), target.cuda(args.rank)
+
+        for bs in range(data.shape[0]):
+            data_name = data_names[bs]
+            if 'kidney_label' in data_name or 'liver_label' in data_name or 'pancreas_label' in data_name:
+                if random.random() > sample_thresh:
+                    healthy_data = data[bs][None,...]
+                    healthy_target = target[bs][None,...]
+                    tumor_types = ['early', 'medium', 'large']
+                    tumor_probs = np.array([0.8, 0.1, 0.1])
+                    synthetic_tumor_type = np.random.choice(tumor_types, p=tumor_probs.ravel())
+                    if synthetic_tumor_type == 'early':
+                        synt_data, synt_target = synthesize_early_tumor(healthy_data, healthy_target, args.organ_type, vqgan, early_sampler)
+                    elif synthetic_tumor_type == 'medium':
+                        synt_data, synt_target = synthesize_medium_tumor(healthy_data, healthy_target, args.organ_type, vqgan, noearly_sampler, ddim_ts=args.ddim_ts)
+                    elif synthetic_tumor_type == 'large':
+                        synt_data, synt_target = synthesize_large_tumor(healthy_data, healthy_target, args.organ_type, vqgan, noearly_sampler, ddim_ts=args.ddim_ts)
+                    
+                    # Save the generated image for visualization
+                    if args.rank == 0: # Ensure saving is done only by the main process
+                        save_synt_img(synt_data.detach().cpu(), synt_target.detach().cpu(), data_name, synthetic_tumor_type, args.save_dir, args.organ_type)
+
+                    data[bs,...] = synt_data[0]
+                    target[bs,...] = synt_target[0]
+        data=data.detach()
+        target=target.detach()
+
+    
 
 
 if __name__ == '__main__':
