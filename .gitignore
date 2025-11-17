@@ -1,0 +1,6 @@
+/STEP3.SegmentationModel/generated_samples1
+/STEP3.SegmentationModel/generated_samples
+/STEP3.SegmentationModel/runs
+/STEP3.SegmentationModel/__pycache__
+/STEP3.SegmentationModel/TumorGeneration/ldm/vq_gan_3d/__pycache__
+/STEP3.SegmentationModel/TumorGeneration/model_weight

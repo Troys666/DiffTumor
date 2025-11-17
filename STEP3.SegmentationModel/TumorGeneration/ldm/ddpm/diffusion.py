@@ -712,7 +712,7 @@ class GaussianDiffusion(nn.Module):
             self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, cond_scale=1.):
+    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, cond_scale=1., un_ct_feat=None):
         x_recon = self.predict_start_from_noise(
             x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale))
 
@@ -736,10 +736,10 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.inference_mode()
-    def p_sample(self, x, t, cond=None, cond_scale=1., clip_denoised=True):
+    def p_sample(self, x, t, cond=None, cond_scale=1., clip_denoised=True, un_ct_feat=None):
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(
-            x=x, t=t, clip_denoised=clip_denoised, cond=cond, cond_scale=cond_scale)
+            x=x, t=t, clip_denoised=clip_denoised, cond=cond, cond_scale=cond_scale, un_ct_feat=un_ct_feat)
         noise = torch.randn_like(x)
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b,
@@ -747,20 +747,26 @@ class GaussianDiffusion(nn.Module):
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, cond=None, cond_scale=1.):
+    def p_sample_loop(self, shape, cond=None, cond_scale=1., un_ct_feat=None, resizers=None):
         device = self.betas.device
 
         b = shape[0]
         img = torch.randn(shape, device=device)
         # print('cond', cond.shape)
         for i in reversed(range(0, self.num_timesteps)):
-            img = self.p_sample(img, torch.full(
-                (b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale)
+            ts = torch.full((b,), i, device=device, dtype=torch.long)
+            img = self.p_sample(img, ts, cond=cond, cond_scale=cond_scale, un_ct_feat=un_ct_feat)
+            
+            # Apply resizer correction if un_ct_feat is provided
+            if un_ct_feat is not None and resizers is not None:
+                down, up = resizers
+                img = img - up(down(img)) + up(
+                    down(self.q_sample(un_ct_feat, ts, torch.randn(*shape, device=device))))
 
         return img
 
     @torch.inference_mode()
-    def sample(self, cond=None, cond_scale=1., batch_size=16):
+    def sample(self, cond=None, cond_scale=1., batch_size=16, un_ct_feat=None, resizers=None):
         device = next(self.denoise_fn.parameters()).device
 
         if is_list_str(cond):
@@ -774,7 +780,7 @@ class GaussianDiffusion(nn.Module):
         # print((batch_size, channels, num_frames, image_size, image_size))
         # print('cond_',cond.shape)
         _sample = self.p_sample_loop(
-            (batch_size, channels, num_frames, image_size, image_size), cond=cond, cond_scale=cond_scale)
+            (batch_size, channels, num_frames, image_size, image_size), cond=cond, cond_scale=cond_scale, un_ct_feat=un_ct_feat, resizers=resizers)
 
         if isinstance(self.vqgan, VQGAN):
             # denormalize TODO: Remove eventually

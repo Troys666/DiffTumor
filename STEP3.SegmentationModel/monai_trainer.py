@@ -202,6 +202,12 @@ def voxel2R_torch(A):
 
 from TumorGeneration.utils import synthesize_early_tumor, synthesize_medium_tumor, synthesize_large_tumor, synt_model_prepare
 import random
+from monai import data as monai_data
+
+# Global cache for non-healthy dataset
+_non_healthy_ds_cache = None
+_non_healthy_names_cache = None
+
 def train_epoch(model, loader, optimizer, scaler, epoch, loss_func, args, tumor_size_list):
 
     model.train()
@@ -223,6 +229,12 @@ def train_epoch(model, loader, optimizer, scaler, epoch, loss_func, args, tumor_
         else:
             data, target, data_names = batch_data['image'], batch_data['label'], batch_data['name']
         data, target = data.cuda(args.rank), target.cuda(args.rank)
+        
+        # Find non-healthy samples in current batch for reference
+        non_healthy_indices = []
+        for i, name in enumerate(data_names):
+            if not ('kidney_label' in name or 'liver_label' in name or 'pancreas_label' in name):
+                non_healthy_indices.append(i)
 
         for bs in range(data.shape[0]):
             data_name = data_names[bs]
@@ -230,15 +242,21 @@ def train_epoch(model, loader, optimizer, scaler, epoch, loss_func, args, tumor_
                 if random.random() > sample_thresh:
                     healthy_data = data[bs][None,...]
                     healthy_target = target[bs][None,...]
+                    
+                    # Use a non-healthy sample from current batch if available
+                    if non_healthy_indices:
+                        ref_idx = random.choice(non_healthy_indices)
+                        non_healthy_data = data[ref_idx][None,...]
+                    
                     tumor_types = ['early', 'medium', 'large']
                     tumor_probs = np.array([0.8, 0.1, 0.1])
                     synthetic_tumor_type = np.random.choice(tumor_types, p=tumor_probs.ravel())
                     if synthetic_tumor_type == 'early':
-                        synt_data, synt_target = synthesize_early_tumor(healthy_data, healthy_target, args.organ_type, vqgan, early_sampler)
+                        synt_data, synt_target = synthesize_early_tumor(healthy_data, healthy_target, non_healthy_data, args.organ_type, vqgan, early_sampler)
                     elif synthetic_tumor_type == 'medium':
-                        synt_data, synt_target = synthesize_medium_tumor(healthy_data, healthy_target, args.organ_type, vqgan, noearly_sampler, ddim_ts=args.ddim_ts)
+                        synt_data, synt_target = synthesize_medium_tumor(healthy_data, healthy_target, non_healthy_data, args.organ_type, vqgan, noearly_sampler, ddim_ts=args.ddim_ts)
                     elif synthetic_tumor_type == 'large':
-                        synt_data, synt_target = synthesize_large_tumor(healthy_data, healthy_target, args.organ_type, vqgan, noearly_sampler, ddim_ts=args.ddim_ts)
+                        synt_data, synt_target = synthesize_large_tumor(healthy_data, healthy_target, non_healthy_data, args.organ_type, vqgan, noearly_sampler, ddim_ts=args.ddim_ts)
                     
                     data[bs,...] = synt_data[0]
                     target[bs,...] = synt_target[0]

@@ -6,7 +6,7 @@ from tqdm import tqdm
 from functools import partial
 
 from .util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like
-
+from resizer import Resizer
 
 class DDIMSampler(object):
     def __init__(self, model, schedule="linear", **kwargs):
@@ -59,6 +59,7 @@ class DDIMSampler(object):
                batch_size,
                shape,
                conditioning=None,
+               un_ct_feat=None,
                callback=None,
                normals_sequence=None,
                img_callback=None,
@@ -88,13 +89,23 @@ class DDIMSampler(object):
                     print(f"Warning: Got {conditioning.shape[0]} conditionings but batch-size is {batch_size}")
 
         self.make_schedule(ddim_num_steps=S, ddim_eta=eta, verbose=verbose)
+
+        
         # sampling
         C, T, H, W = shape
         # breakpoint()
         size = (batch_size, C, T, H, W)
-        # print(f'Data shape for DDIM sampling is {size}, eta {eta}')
+        print(size)
+        #import pdb; pdb.set_trace()
 
-        samples, intermediates = self.ddim_sampling(conditioning, size,
+        shape=size
+        # print(f'Data shape for DDIM sampling is {size}, eta {eta}')
+        shape_d = (batch_size, C, T, H/12, W/12)
+        down = Resizer(shape, 1 / 12).to(self.model.device)
+        up = Resizer(shape_d, 12).to(self.model.device)
+        resizers = (down, up)
+
+        samples, intermediates = self.ddim_sampling(conditioning, size,un_ct_feat,
                                                     callback=callback,
                                                     img_callback=img_callback,
                                                     quantize_denoised=quantize_x0,
@@ -105,6 +116,7 @@ class DDIMSampler(object):
                                                     score_corrector=score_corrector,
                                                     corrector_kwargs=corrector_kwargs,
                                                     x_T=x_T,
+                                                    resizers=resizers,
                                                     log_every_t=log_every_t,
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
@@ -112,8 +124,8 @@ class DDIMSampler(object):
         return samples, intermediates
 
     @torch.no_grad()
-    def ddim_sampling(self, cond, shape,
-                      x_T=None, ddim_use_original_steps=False,
+    def ddim_sampling(self, cond, shape, un_ct_feat,
+                      x_T=None, ddim_use_original_steps=False, resizers=None,
                       callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, log_every_t=100,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
@@ -147,13 +159,16 @@ class DDIMSampler(object):
                 img_orig = self.model.q_sample(x0, ts)  # TODO: deterministic forward pass?
                 img = img_orig * mask + (1. - mask) * img
 
-            outs = self.p_sample_ddim(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
+            outs = self.p_sample_ddim(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps, 
                                       quantize_denoised=quantize_denoised, temperature=temperature,
                                       noise_dropout=noise_dropout, score_corrector=score_corrector,
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale,
                                       unconditional_conditioning=unconditional_conditioning)
             img, pred_x0 = outs
+            down, up = resizers
+            img= img - up(down(img)) + up(
+                            down(self.model.q_sample(un_ct_feat, ts, torch.randn(*shape, device=device))))
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
 
@@ -164,7 +179,7 @@ class DDIMSampler(object):
         return img, intermediates
 
     @torch.no_grad()
-    def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
+    def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False, 
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None):
         b, *_, device = *x.shape, x.device

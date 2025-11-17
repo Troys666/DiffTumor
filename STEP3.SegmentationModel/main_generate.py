@@ -124,7 +124,7 @@ parser.add_argument('--datafold_dir', default=None, type=str)
 parser.add_argument('--cache_num', default=200, type=int)
 
 parser.add_argument('--use_pretrained', action='store_true')
-parser.add_argument('--save_dir', default='./generated_samples', type=str, help='directory to save generated images')
+parser.add_argument('--save_dir', default='./generated_samples1', type=str, help='directory to save generated images')
 
 class RandCropByPosNegLabeld_select(transforms.RandCropByPosNegLabeld):
     def __init__(self, keys, label_key, spatial_size, 
@@ -576,6 +576,12 @@ def main_worker(gpu, args):
         sample_thresh = 0.5
     # model prepare
     vqgan, early_sampler, noearly_sampler= synt_model_prepare(device = torch.device("cuda", args.rank), fold=args.fold, organ=args.organ_model)
+  
+
+    # Create a dataset for non-healthy (tumor) cases to randomly sample from
+    non_healthy_dicts = [{'image': image, 'label': label, 'name': name}
+            for image, label, name in zip(train_img_healthy, train_lbl_healthy, train_name_healthy)]
+    non_healthy_ds = monai_data.Dataset(data=non_healthy_dicts, transform=train_transform)
 
     for idx, batch_data in enumerate(train_loader):
 
@@ -589,17 +595,51 @@ def main_worker(gpu, args):
             data_name = data_names[bs]
             if 'kidney_label' in data_name or 'liver_label' in data_name or 'pancreas_label' in data_name:
                 if random.random() > sample_thresh:
-                    healthy_data = data[bs][None,...]
-                    healthy_target = target[bs][None,...]
+                    # Determine tumor type first
                     tumor_types = ['early', 'medium', 'large']
                     tumor_probs = np.array([0.8, 0.1, 0.1])
                     synthetic_tumor_type = np.random.choice(tumor_types, p=tumor_probs.ravel())
+                    
+                    # Select non-healthy sample based on tumor type
+                    # early uses tiny/small, medium uses medium, large uses large
                     if synthetic_tumor_type == 'early':
-                        synt_data, synt_target = synthesize_early_tumor(healthy_data, healthy_target, args.organ_type, vqgan, early_sampler)
+                        target_sizes = ['tiny', 'small']
                     elif synthetic_tumor_type == 'medium':
-                        synt_data, synt_target = synthesize_medium_tumor(healthy_data, healthy_target, args.organ_type, vqgan, noearly_sampler, ddim_ts=args.ddim_ts)
+                        target_sizes = ['medium']
+                    else:  # large
+                        target_sizes = ['large']
+                    
+                    # Filter non-healthy samples by tumor size in their names
+                    matching_indices = []
+                    for i, name in enumerate(train_name_healthy):
+                        for target_size in target_sizes:
+                            if target_size in name.lower():
+                                matching_indices.append(i)
+                                break
+                    
+                    if matching_indices:
+                        random_idx = random.choice(matching_indices)
+                    else:
+                        random_idx = random.randint(0, len(non_healthy_ds) - 1)
+                    
+                    non_healthy_sample = non_healthy_ds[random_idx]
+                    non_healthy_data = non_healthy_sample[0]['image'][None,...].cuda(args.rank)
+                    non_healthy_target = non_healthy_sample[0]['label'][None,...].cuda(args.rank)
+                    non_healthy_name = non_healthy_sample[0]['name']
+                    
+                    # Extract organ mask (label==1) and tumor mask (label==2) from non_healthy_target
+                    non_healthy_organ_mask = (non_healthy_target == 1).float()
+                    non_healthy_tumor_mask = (non_healthy_target == 2).float()
+                    
+                    healthy_data = data[bs][None,...]
+                    healthy_target = target[bs][None,...]
+                    
+                    if synthetic_tumor_type == 'early':
+                        synt_data, synt_target = synthesize_early_tumor(healthy_data, healthy_target, non_healthy_data, args.organ_type, vqgan, early_sampler)
+                    elif synthetic_tumor_type == 'medium':
+                        synt_data, synt_target = synthesize_medium_tumor(healthy_data, healthy_target, non_healthy_data, args.organ_type, vqgan, noearly_sampler, ddim_ts=args.ddim_ts)
                     elif synthetic_tumor_type == 'large':
-                        synt_data, synt_target = synthesize_large_tumor(healthy_data, healthy_target, args.organ_type, vqgan, noearly_sampler, ddim_ts=args.ddim_ts)
+                        synt_data, synt_target = synthesize_large_tumor(healthy_data, healthy_target, non_healthy_data, args.organ_type, vqgan, noearly_sampler, ddim_ts=args.ddim_ts)
                     
                     # Save the generated image for visualization
                     if args.rank == 0: # Ensure saving is done only by the main process

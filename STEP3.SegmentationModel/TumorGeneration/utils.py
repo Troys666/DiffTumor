@@ -258,7 +258,7 @@ def synt_model_prepare(device, vqgan_ckpt='TumorGeneration/model_weight/Autoenco
 
     return vqgan, early_tester, noearly_sampler
 
-def synthesize_early_tumor(ct_volume, organ_mask, organ_type, vqgan, tester):
+def synthesize_early_tumor(ct_volume,organ_mask, un_ct, organ_type, vqgan, tester):
     device=ct_volume.device
 
     # generate tumor mask
@@ -275,14 +275,20 @@ def synthesize_early_tumor(ct_volume, organ_mask, organ_type, vqgan, tester):
         total_tumor_mask = torch.stack(total_tumor_mask, dim=0).to(dtype=torch.float32, device=device)
 
         volume = ct_volume*2.0 - 1.0
+        un_volume=un_ct*2.0-1.0
         mask = total_tumor_mask*2.0 - 1.0
         mask_ = 1-total_tumor_mask
         masked_volume = (volume*mask_).detach()
         
         volume = volume.permute(0,1,-1,-3,-2)
+        un_volume=un_volume.permute(0,1,-1,-3,-2)
         masked_volume = masked_volume.permute(0,1,-1,-3,-2)
         mask = mask.permute(0,1,-1,-3,-2)
 
+        un_volume_feat = vqgan.encode(un_volume, quantize=False, include_embeddings=True)
+        un_volume_feat = ((un_volume_feat - vqgan.codebook.embeddings.min()) /
+                (vqgan.codebook.embeddings.max() - vqgan.codebook.embeddings.min())) * 2.0 - 1.0
+        
         # vqgan encoder inference
         masked_volume_feat = vqgan.encode(masked_volume, quantize=False, include_embeddings=True)
         masked_volume_feat = ((masked_volume_feat - vqgan.codebook.embeddings.min()) /
@@ -293,7 +299,13 @@ def synthesize_early_tumor(ct_volume, organ_mask, organ_type, vqgan, tester):
 
         # diffusion inference and decoder
         tester.ema_model.eval()
-        sample = tester.ema_model.sample(batch_size=volume.shape[0], cond=cond)
+        shape = masked_volume_feat.shape
+        shape_d = (volume.shape[0], masked_volume_feat.shape[1], masked_volume_feat.shape[2], masked_volume_feat.shape[3]/12, masked_volume_feat.shape[4]/12)
+        from resizer import Resizer
+        down = Resizer(shape, 1 / 12).to(device)
+        up = Resizer(shape_d, 12).to(device)
+        resizers = (down, up)
+        sample = tester.ema_model.sample(batch_size=volume.shape[0], cond=cond, un_ct_feat=un_volume_feat, resizers=resizers)
 
         if organ_type == 'liver' or organ_type == 'kidney' :
             # post-process
@@ -314,7 +326,7 @@ def synthesize_early_tumor(ct_volume, organ_mask, organ_type, vqgan, tester):
 
     return final_volume_, organ_tumor_mask
 
-def synthesize_medium_tumor(ct_volume, organ_mask, organ_type, vqgan, sampler, ddim_ts=50):
+def synthesize_medium_tumor(ct_volume, organ_mask,un_ct, organ_type, vqgan, sampler, ddim_ts=50):
     device=ct_volume.device
 
     total_tumor_mask = []
@@ -326,17 +338,23 @@ def synthesize_medium_tumor(ct_volume, organ_mask, organ_type, vqgan, sampler, d
             tumor_mask = get_fixed_geo(organ_mask_np[bs,0], synthetic_tumor_type, organ_type)
             total_tumor_mask.append(torch.from_numpy(tumor_mask)[None,:])
         total_tumor_mask = torch.stack(total_tumor_mask, dim=0).to(dtype=torch.float32, device=device)
-
+ 
         volume = ct_volume*2.0 - 1.0
+        un_volume=un_ct*2.0-1.0
         mask = total_tumor_mask*2.0 - 1.0
         mask_ = 1-total_tumor_mask
         masked_volume = (volume*mask_).detach()
         
         volume = volume.permute(0,1,-1,-3,-2)
+        un_volume=un_volume.permute(0,1,-1,-3,-2)
         masked_volume = masked_volume.permute(0,1,-1,-3,-2)
         mask = mask.permute(0,1,-1,-3,-2)
 
         # vqgan encoder inference
+        un_volume_feat = vqgan.encode(un_volume, quantize=False, include_embeddings=True)
+        un_volume_feat = ((un_volume_feat - vqgan.codebook.embeddings.min()) /
+                (vqgan.codebook.embeddings.max() - vqgan.codebook.embeddings.min())) * 2.0 - 1.0
+        
         masked_volume_feat = vqgan.encode(masked_volume, quantize=False, include_embeddings=True)
         masked_volume_feat = ((masked_volume_feat - vqgan.codebook.embeddings.min()) /
                 (vqgan.codebook.embeddings.max() - vqgan.codebook.embeddings.min())) * 2.0 - 1.0
@@ -348,6 +366,7 @@ def synthesize_medium_tumor(ct_volume, organ_mask, organ_type, vqgan, sampler, d
         shape = masked_volume_feat.shape[-4:]
         samples_ddim, _ = sampler.sample(S=ddim_ts,
                                         conditioning=cond,
+                                        un_ct_feat=un_volume_feat,
                                         batch_size=1,
                                         shape=shape,
                                         verbose=False)
@@ -378,7 +397,7 @@ def synthesize_medium_tumor(ct_volume, organ_mask, organ_type, vqgan, sampler, d
 
     return final_volume_, organ_tumor_mask
 
-def synthesize_large_tumor(ct_volume, organ_mask, organ_type, vqgan, sampler, ddim_ts=50):
+def synthesize_large_tumor(ct_volume,organ_mask,un_ct, organ_type, vqgan, sampler, ddim_ts=50):
     device=ct_volume.device
 
     total_tumor_mask = []
@@ -392,15 +411,21 @@ def synthesize_large_tumor(ct_volume, organ_mask, organ_type, vqgan, sampler, dd
         total_tumor_mask = torch.stack(total_tumor_mask, dim=0).to(dtype=torch.float32, device=device)
 
         volume = ct_volume*2.0 - 1.0
+        un_volume=un_ct*2.0-1.0
         mask = total_tumor_mask*2.0 - 1.0
         mask_ = 1-total_tumor_mask
         masked_volume = (volume*mask_).detach()
         
         volume = volume.permute(0,1,-1,-3,-2)
+        un_volume=un_volume.permute(0,1,-1,-3,-2)
         masked_volume = masked_volume.permute(0,1,-1,-3,-2)
         mask = mask.permute(0,1,-1,-3,-2)
 
         # vqgan encoder inference
+        un_volume_feat = vqgan.encode(un_volume, quantize=False, include_embeddings=True)
+        un_volume_feat = ((un_volume_feat - vqgan.codebook.embeddings.min()) /
+                (vqgan.codebook.embeddings.max() - vqgan.codebook.embeddings.min())) * 2.0 - 1.0
+        
         masked_volume_feat = vqgan.encode(masked_volume, quantize=False, include_embeddings=True)
         masked_volume_feat = ((masked_volume_feat - vqgan.codebook.embeddings.min()) /
                 (vqgan.codebook.embeddings.max() - vqgan.codebook.embeddings.min())) * 2.0 - 1.0
@@ -412,6 +437,7 @@ def synthesize_large_tumor(ct_volume, organ_mask, organ_type, vqgan, sampler, dd
         shape = masked_volume_feat.shape[-4:]
         samples_ddim, _ = sampler.sample(S=ddim_ts,
                                         conditioning=cond,
+                                        un_ct_feat=un_volume_feat,
                                         batch_size=1,
                                         shape=shape,
                                         verbose=False)
